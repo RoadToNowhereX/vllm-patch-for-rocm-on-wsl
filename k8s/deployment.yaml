@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+      - name: vllm
+        # Build the image using the Dockerfile.diff in this repo applied on
+        # top of bluefalcon13/vllm-rocm, then import it to your container runtime.
+        image: localhost/vllm-rocm-gfx1201:latest
+        imagePullPolicy: Never
+        args:
+        # NOTE: do NOT name your Service "vllm" — k8s auto-injects VLLM_PORT
+        # env vars that conflict with vLLM's own config. Use a different
+        # service name (e.g. "llm-api") and keep the Deployment named "vllm".
+        - "/models/your-model.gguf"
+        - "--served-model-name"
+        - "your-model-name"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--max-model-len"
+        - "1024"
+        - "--gpu-memory-utilization"
+        - "0.95"
+        - "--enforce-eager"
+        - "--dtype"
+        - "float16"
+        # CRITICAL for 14B GGUF models on 16 GB cards:
+        # _create_padded_weight_param allocates a temp FP16 buffer for merged
+        # weights during loading. On a ~9 GB Q4_K_M model it pushes past
+        # 16 GB VRAM. Offloading 4 GB to CPU RAM via UVA clears the spike.
+        # See README for the full story.
+        - "--cpu-offload-gb"
+        - "4"
+        env:
+        # All three RDNA 4 runtime patches rely on this env var for the
+        # GCN arch fallback — do not remove it.
+        - name: PYTORCH_ROCM_ARCH
+          value: "gfx1201"
+        - name: VLLM_TARGET_DEVICE
+          value: "rocm"
+        - name: ROCM_PATH
+          value: "/opt/rocm"
+        - name: LD_LIBRARY_PATH
+          value: "/opt/rocm/lib"
+        - name: HSA_OVERRIDE_GFX_VERSION
+          value: "12.0.1"
+        - name: FLASH_ATTENTION_TRITON_AMD_ENABLE
+          value: "TRUE"
+        # CUDA_VISIBLE_DEVICES et al. are required so the torch.device_count
+        # monkey-patch in rocm.py sees the right device index.
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: HIP_VISIBLE_DEVICES
+          value: "0"
+        - name: ROCR_VISIBLE_DEVICES
+          value: "0"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "garbage_collection_threshold:0.9"
+        ports:
+        - containerPort: 8000
+          name: http
+        # Readiness only — no liveness. vLLM's /health path runs through the
+        # engine; hit /ping instead for a cheap 200. Long period so the probe
+        # doesn't hot-path the GPU.
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 300
+          timeoutSeconds: 10
+          failureThreshold: 3
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        - name: dev-kfd
+          mountPath: /dev/kfd
+        - name: dev-dri
+          mountPath: /dev/dri
+        securityContext:
+          privileged: true
+        resources:
+          limits:
+            # 16 Gi for the CPU-offloaded weights on top of the container's
+            # own footprint. Drop this if you are not using --cpu-offload-gb.
+            memory: "16Gi"
+      volumes:
+      - name: models
+        hostPath:
+          path: /path/to/your/models
+          type: Directory
+      - name: dev-kfd
+        hostPath:
+          path: /dev/kfd
+          type: CharDevice
+      - name: dev-dri
+        hostPath:
+          path: /dev/dri
+          type: Directory
+---
+# Do NOT name this Service "vllm" — see note in the Deployment above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-api
+  namespace: default
+spec:
+  selector:
+    app: vllm
+  ports:
+  - port: 8000
+    targetPort: 8000
+    name: http
+  type: ClusterIP

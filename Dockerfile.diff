@@ -1,0 +1,74 @@
+diff --git a/Dockerfile b/Dockerfile
+index d71d57b..a296647 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,4 +1,3 @@
+-# syntax=docker/dockerfile:1-labs
+ ARG AMDGPU_FAMILY=gfx120X-all
+ ARG GPU_ARCH=gfx1201
+ ARG ROCM_VERSION=7.12.0a20260205
+@@ -19,7 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     git \
+     libatomic1 \
+     libgomp1 \
++    libdrm-dev \
+     libnuma-dev \
++    ninja-build \
+     wget && \
+     rm -rf /var/lib/apt/lists/*
+ 
+@@ -51,8 +52,7 @@ RUN mkdir -p /opt/rocm-$ROCM_VERSION && \
+ 
+ ENV ROCM_PATH=/opt/rocm
+ ENV LD_LIBRARY_PATH=$ROCM_PATH/lib
+-# ENV CMAKE_PREFIX_PATH="/app/.venv/lib/python3.12/site-packages/torch/share/cmake/Torch"
+-ENV DEVICE_LIB_PATH=$ROCM_PATH/llvm/amdgcn/bitcode  
++ENV DEVICE_LIB_PATH=$ROCM_PATH/llvm/amdgcn/bitcode
+ ENV HIP_DEVICE_LIB_PATH=$ROCM_PATH/llvm/amdgcn/bitcode
+ ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+ ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+@@ -67,10 +67,16 @@ ENV Torch_DIR="/app/.venv/lib/python3.12/site-packages/torch/share/cmake/Torch"
+ # copy .bash_profile to .bashrc
+ RUN cp /root/.bash_profile /root/.bashrc
+ 
++# workaround: PyTorch nightly cmake files have hardcoded build paths from AMD's build server.
++# The path /therock/.../pkgconfig/../../include resolves to /therock/.../rocm_sysdeps/include.
++# Create both the intermediate dirs (for ../../ traversal) and the resolved target dir.
++RUN mkdir -p /therock/output/build/third-party/sysdeps/linux/libdrm/build/stage/lib/rocm_sysdeps/lib/pkgconfig && \
++    mkdir -p /therock/output/build/third-party/sysdeps/linux/libdrm/build/stage/lib/rocm_sysdeps/include && \
++    cp -r /usr/include/libdrm /therock/output/build/third-party/sysdeps/linux/libdrm/build/stage/lib/rocm_sysdeps/include/ && \
++    cp /usr/include/xf86drm*.h /therock/output/build/third-party/sysdeps/linux/libdrm/build/stage/lib/rocm_sysdeps/include/
+ 
+-
+-# clone vllm
+-RUN --security=insecure git clone https://github.com/vllm-project/vllm.git && \
++# clone vllm and build
++RUN git clone https://github.com/vllm-project/vllm.git && \
+     cd vllm && git checkout -b v0.16.0rc0 && \
+     python use_existing_torch.py && \
+     uv pip install --upgrade numba \
+@@ -78,15 +84,19 @@ RUN --security=insecure git clone https://github.com/vllm-project/vllm.git && \
+         cmake \
+         setuptools_scm && \
+     uv pip install "numpy<2" && \
+-    # uv pip install -r requirements/rocm.txt
+     uv pip install -r requirements/rocm.txt && \
+     python setup.py develop && \
+     uv pip install /opt/rocm/share/amd_smi
+ 
+-RUN git clone https://github.com/hyoon1/flash-attention.git && \    
+-# RUN git clone https://github.com/ROCm/flash-attention.git && \
++# workaround: RDNA 4 (gfx1201) - amdsmi fails in containers, torch.cuda.device_count()=0
++# but HIP and actual GPU operations work fine. Patch vLLM to use HIP for platform detection
++# and PYTORCH_ROCM_ARCH env var for GCN arch lookup.
++COPY vllm_rdna4_patches.py /tmp/vllm_rdna4_patches.py
++RUN python /tmp/vllm_rdna4_patches.py
++
++RUN git clone https://github.com/hyoon1/flash-attention.git && \
+     cd flash-attention && \
+     git checkout enable-ck-gfx12 && \
+     FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+ 
+-ENTRYPOINT [ "/app/.venv/bin/vllm","serve"]
+\ No newline at end of file
++ENTRYPOINT [ "/app/.venv/bin/vllm","serve"]
