@@ -32,7 +32,9 @@ from pathlib import Path
 DEFAULT_GCN_ARCH = "gfx1151"
 PLATFORM_MARKER = "WSL2_AMDSMI_HIP_PLATFORM_PATCH"
 ARCH_MARKER = "WSL2_AMDSMI_ARCH_FALLBACK"
-DEVICE_COUNT_MARKER = "WSL2_HIP_DEVICE_COUNT_PATCH"
+ROCM_DEVICE_COUNT_MARKER = "WSL2_AMDSMI_HIP_DEVICE_COUNT_PATCH"
+DEVICE_NAME_MARKER = "WSL2_AMDSMI_DEVICE_NAME_FALLBACK"
+LEGACY_DEVICE_COUNT_MARKER = "WSL2_HIP_DEVICE_COUNT_PATCH"
 
 
 class PatchError(RuntimeError):
@@ -96,6 +98,40 @@ def _find_top_level_function(source: str, name: str) -> ast.FunctionDef:
     return matches[0]
 
 
+def _definition_start(definition: ast.FunctionDef) -> int:
+    """Return the first source line occupied by a definition or decorator."""
+    return min(
+        [definition.lineno] + [decorator.lineno for decorator in definition.decorator_list]
+    )
+
+
+def _find_class_method(source: str, class_name: str, method_name: str) -> ast.FunctionDef:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise PatchError(f"Could not parse target source: {exc}") from exc
+
+    classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ]
+    if len(classes) != 1:
+        raise PatchError(
+            f"Expected exactly one class named {class_name!r}; found {len(classes)}."
+        )
+    methods = [
+        node
+        for node in classes[0].body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    ]
+    if len(methods) != 1:
+        raise PatchError(
+            f"Expected exactly one {class_name}.{method_name}() method; found {len(methods)}."
+        )
+    return methods[0]
+
+
 def _replace_lines(source: str, start: int, end: int, replacement: str) -> str:
     """Replace a 1-based, inclusive line range while preserving all other text."""
     lines = source.splitlines(keepends=True)
@@ -106,7 +142,7 @@ def _replace_lines(source: str, start: int, end: int, replacement: str) -> str:
 
 
 def patch_platform_detection(source: str) -> tuple[str, str]:
-    """Replace amdsmi platform discovery with HIP device enumeration."""
+    """Use HIP only when the upstream amdsmi platform check fails."""
     function = _find_top_level_function(source, "rocm_platform_plugin")
     original = ast.get_source_segment(source, function) or ""
     if PLATFORM_MARKER in original:
@@ -114,25 +150,44 @@ def patch_platform_detection(source: str) -> tuple[str, str]:
 
     replacement = f'''def rocm_platform_plugin() -> str | None:
     # {PLATFORM_MARKER}
-    """Report ROCm when HIP can enumerate at least one visible device."""
-    logger.debug("Checking if ROCm platform is available via HIP.")
+    """Detect ROCm with amdsmi, falling back to HIP for WSL2."""
+    is_rocm = False
+    logger.debug("Checking if ROCm platform is available.")
     try:
-        import ctypes
+        import amdsmi
 
-        hip = ctypes.CDLL("libamdhip64.so")
-        hip.hipGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
-        hip.hipGetDeviceCount.restype = ctypes.c_int
-        count = ctypes.c_int()
-        result = hip.hipGetDeviceCount(ctypes.byref(count))
-        if result == 0 and count.value > 0:
-            logger.debug("ROCm platform available via HIP with %d device(s).", count.value)
-            return "vllm.platforms.rocm.RocmPlatform"
-        logger.debug("ROCm unavailable via HIP (result=%d, count=%d).", result, count.value)
-    except Exception as exc:
-        logger.debug("ROCm unavailable via HIP: %s", exc)
-    return None
+        amdsmi.amdsmi_init()
+        try:
+            is_rocm = len(amdsmi.amdsmi_get_processor_handles()) > 0
+            if is_rocm:
+                logger.debug("Confirmed ROCm platform is available via amdsmi.")
+        finally:
+            amdsmi.amdsmi_shut_down()
+    except Exception as amdsmi_exc:
+        logger.debug("amdsmi platform check failed: %s; trying HIP.", amdsmi_exc)
+        try:
+            import ctypes
+
+            hip = ctypes.CDLL("libamdhip64.so")
+            hip.hipGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            hip.hipGetDeviceCount.restype = ctypes.c_int
+            count = ctypes.c_int()
+            result = hip.hipGetDeviceCount(ctypes.byref(count))
+            is_rocm = result == 0 and count.value > 0
+            if is_rocm:
+                logger.debug("Confirmed ROCm platform is available via HIP.")
+            else:
+                logger.debug(
+                    "ROCm unavailable via HIP (result=%d, count=%d).", result, count.value
+                )
+        except Exception as hip_exc:
+            logger.debug("ROCm unavailable via HIP: %s", hip_exc)
+    return "vllm.platforms.rocm.RocmPlatform" if is_rocm else None
 '''
-    return _replace_lines(source, function.lineno, function.end_lineno, replacement), "applied"
+    return (
+        _replace_lines(source, _definition_start(function), function.end_lineno, replacement),
+        "applied",
+    )
 
 
 def _ensure_os_import(source: str) -> str:
@@ -154,51 +209,51 @@ def _ensure_os_import(source: str) -> str:
 
 
 def patch_gcn_arch_fallback(source: str) -> tuple[str, str]:
-    """Avoid the amdsmi failure path when resolving the active GCN architecture."""
+    """Avoid amdsmi altogether when resolving the WSL2 GCN architecture."""
     function = _find_top_level_function(source, "_get_gcn_arch")
     original = ast.get_source_segment(source, function) or ""
     if ARCH_MARKER in original:
         return source, "already applied"
 
-    try_nodes = [node for node in function.body if isinstance(node, ast.Try)]
-    if len(try_nodes) != 1 or len(try_nodes[0].handlers) != 1:
-        raise PatchError("Expected one amdsmi try/except block in _get_gcn_arch().")
-    try_node = try_nodes[0]
-    if "amdsmi" not in (ast.get_source_segment(source, try_node) or ""):
-        raise PatchError("The _get_gcn_arch() try/except block is not amdsmi-based.")
+    if "amdsmi" not in original:
+        raise PatchError("The _get_gcn_arch() implementation is not amdsmi-based.")
 
-    handler = try_node.handlers[0]
-    replacement = f'''    except Exception as exc:
-        logger.debug("Failed to get GCN arch via amdsmi: %s", exc)
-
+    replacement = f'''def _get_gcn_arch() -> str:
     # {ARCH_MARKER}
-    # WSL2 fallback: amdsmi may fail even though HIP can use the GPU.
-    # Explicit user configuration always takes precedence over gfx1151.
+    """Return the configured WSL2 architecture without initializing amdsmi."""
     arch = os.environ.get("PYTORCH_ROCM_ARCH") or "{DEFAULT_GCN_ARCH}"
-    logger.info("Using %s for GCN arch after amdsmi fallback", arch)
+    logger.info("Using %s for GCN arch in the WSL2 amdsmi fallback", arch)
     return arch
 '''
-    source = _replace_lines(source, handler.lineno, function.end_lineno, replacement)
+    source = _replace_lines(
+        source, _definition_start(function), function.end_lineno, replacement
+    )
     return _ensure_os_import(source), "applied"
 
 
-def patch_torch_device_count(source: str) -> tuple[str, str]:
-    """Make vLLM use HIP enumeration when torch reports zero visible devices."""
-    if DEVICE_COUNT_MARKER in source:
+def _remove_legacy_device_count_patch(source: str) -> str:
+    """Remove the pre-v0.25 monkey patch when upgrading an existing target."""
+    if LEGACY_DEVICE_COUNT_MARKER not in source:
+        return source
+
+    start = source.index(f"# {LEGACY_DEVICE_COUNT_MARKER}")
+    end_marker = "_ON_GFX1X ="
+    end = source.find(end_marker, start)
+    if end < 0:
+        raise PatchError("Could not remove the legacy torch device-count patch.")
+    return source[:start] + source[end:]
+
+
+def patch_rocm_device_count(source: str) -> tuple[str, str]:
+    """Patch v0.25's ROCm-specific, amdsmi-backed device counter."""
+    source = _remove_legacy_device_count_patch(source)
+    function = _find_top_level_function(source, "_rocm_device_count_stateless")
+    original = ast.get_source_segment(source, function) or ""
+    if ROCM_DEVICE_COUNT_MARKER in original:
         return source, "already applied"
 
-    marker = "_GCN_ARCH = _get_gcn_arch()"
-    occurrences = source.count(marker)
-    if occurrences != 1:
-        raise PatchError(
-            f"Expected exactly one {marker!r} marker in rocm.py; found {occurrences}."
-        )
-
-    injection = f'''{marker}
-
-# {DEVICE_COUNT_MARKER}
-def _hip_device_count() -> int:
-    """Return the number of HIP-visible devices, or zero when HIP is unavailable."""
+    replacement = f'''def _hip_device_count() -> int:
+    """Return HIP-visible GPU count, including in WSL2 without amdsmi."""
     try:
         import ctypes
 
@@ -213,35 +268,75 @@ def _hip_device_count() -> int:
         return 0
 
 
-def _patch_torch_device_count() -> None:
-    import torch
+@lru_cache(maxsize=8)
+def _rocm_device_count_stateless(cuda_visible_devices: str | None = None) -> int:
+    # {ROCM_DEVICE_COUNT_MARKER}
+    """Count ROCm devices, using HIP if the amdsmi counter is unusable."""
+    # Keep the parameter as part of the cache key, matching the upstream API.
+    del cuda_visible_devices
+    import torch.cuda
+
+    if not torch.cuda._is_compiled():
+        return 0
 
     try:
-        torch_count = torch.cuda.device_count()
+        amdsmi_count = (
+            torch.cuda._device_count_amdsmi()
+            if hasattr(torch.cuda, "_device_count_amdsmi")
+            else 0
+        )
     except Exception as exc:
-        logger.debug("torch device_count failed: %s", exc)
-        torch_count = 0
+        logger.debug("amdsmi device-count query failed: %s", exc)
+        amdsmi_count = 0
 
-    if torch_count != 0:
-        return
-
-    hip_count = _hip_device_count()
-    if hip_count <= 0:
-        return
-
-    def device_count() -> int:
-        return hip_count
-
-    torch.cuda.device_count = device_count
-    accelerator = getattr(torch, "accelerator", None)
-    if accelerator is not None and hasattr(accelerator, "device_count"):
-        accelerator.device_count = device_count
-    logger.info("Patched torch device_count to %d via HIP", hip_count)
-
-
-_patch_torch_device_count()
+    if amdsmi_count > 0:
+        return amdsmi_count
+    return _hip_device_count()
 '''
-    return source.replace(marker, injection, 1), "applied"
+    return (
+        _replace_lines(
+            source, _definition_start(function), function.end_lineno, replacement
+        ),
+        "applied",
+    )
+
+
+def patch_device_name_fallback(source: str) -> tuple[str, str]:
+    """Fall back to torch properties when WSL2 cannot initialize amdsmi."""
+    method = _find_class_method(source, "RocmPlatform", "get_device_name")
+    original = ast.get_source_segment(source, method) or ""
+    if DEVICE_NAME_MARKER in original:
+        return source, "already applied"
+
+    replacement = f'''    @classmethod
+    @lru_cache(maxsize=8)
+    def get_device_name(cls, device_id: int = 0) -> str:
+        # {DEVICE_NAME_MARKER}
+        try:
+            amdsmi_init()
+            try:
+                physical_device_id = cls.device_id_to_physical_device_id(device_id)
+                handle = amdsmi_get_processor_handles()[physical_device_id]
+                asic_info = amdsmi_get_gpu_asic_info(handle)
+                device_id_from_asic: str = asic_info["device_id"]
+                return _ROCM_DEVICE_ID_NAME_MAP.get(
+                    device_id_from_asic, asic_info["market_name"]
+                )
+            finally:
+                amdsmi_shut_down()
+        except Exception as exc:
+            logger.debug("Failed to get device name via amdsmi: %s", exc)
+            return torch.cuda.get_device_properties(device_id).name
+'''
+    return (
+        _replace_lines(source, _definition_start(method), method.end_lineno, replacement),
+        "applied",
+    )
+
+
+def patch_torch_device_count(source: str) -> tuple[str, str]:
+    """Compatibility alias for callers of the pre-v0.25 patch function."""
+    return patch_rocm_device_count(source)
 
 
 def _backup_and_write(path: Path, content: str) -> None:
@@ -297,12 +392,14 @@ def main() -> int:
 
         patched_platform, platform_status = patch_platform_detection(platform_source)
         patched_rocm, arch_status = patch_gcn_arch_fallback(rocm_source)
-        patched_rocm, device_count_status = patch_torch_device_count(patched_rocm)
+        patched_rocm, device_count_status = patch_rocm_device_count(patched_rocm)
+        patched_rocm, device_name_status = patch_device_name_fallback(patched_rocm)
 
         print(f"vLLM package: {vllm_package}")
         print(f"Platform detection: {platform_status}")
         print(f"GCN architecture fallback: {arch_status}")
-        print(f"torch device count fallback: {device_count_status}")
+        print(f"ROCm device count fallback: {device_count_status}")
+        print(f"Device name fallback: {device_name_status}")
         print(f"Default GCN architecture: {DEFAULT_GCN_ARCH}")
 
         if args.dry_run:
